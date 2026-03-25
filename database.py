@@ -24,7 +24,7 @@ def get_user_by_email(email: str):
 
 def create_user(username: str, email: str, hashed_password: str):
     cursor.execute(
-        "INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s) RETURNING id, username, email;", 
+        "INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s) RETURNING user_id, username, email;", 
         (username, email, hashed_password)
     )
     conn.commit()
