@@ -182,3 +182,27 @@ def delete_document(doc_id: int, current_user: dict = Depends(get_current_user))
         os.remove(file_path)
         
     return {"message": "Документ успешно удален"}
+
+@app.get("/documents")
+async def get_documents(current_user: dict = Depends(get_current_user)):
+    cursor.execute("""
+        SELECT id, file_name, file_path, ocr_name, ocr_date, ocr_sum, created_at 
+        FROM user_files 
+        WHERE user_id = %s 
+        ORDER BY created_at DESC;
+    """, (current_user["id"],))
+    records = cursor.fetchall()
+    conn.commit()
+    
+    documents = []
+    for row in records:
+        documents.append({
+            "id": row[0],
+            "file_name": row[1],
+            "file_url": f"http://localhost:8000/{row[2]}",
+            "ocr_name": row[3],
+            "ocr_date": row[4],
+            "ocr_sum": row[5],
+            "created_at": row[6].strftime("%H:%M %d.%m.%Y")
+        })
+    return documents
