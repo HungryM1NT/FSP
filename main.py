@@ -2,33 +2,19 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, status, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 import easyocr
 import re
-# import numpy as np
 import cv2
 from models import *
 import os
 from dotenv import load_dotenv
-import psycopg2
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
-import hashlib
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import shutil
-
+import database as db
 
 load_dotenv()
-
-# DATABASE
-database = os.environ['POSTGRES_DB']
-user = os.environ['POSTGRES_USER']
-password = os.environ['POSTGRES_DB_PASSWORD']
-conn = psycopg2.connect(database=database,
-                        user=user,
-                        password=password,
-                        host="localhost",
-                        port="5432", )
-cursor = conn.cursor()
 
 # HASH
 SECRET_KEY = os.environ['HASH_SECRET_KEY']
@@ -54,10 +40,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
-        cursor.execute("SELECT * FROM users WHERE email = %s;", (email,))
-        user = cursor.fetchone()
-        conn.commit()
-        if user is None: raise HTTPException(status_code=401)
+        
+        user = db.get_user_by_email(email)
+        
+        if user is None: 
+            raise HTTPException(status_code=401)
         return {"id": user[0], "username": user[1], "email": user[2]}
     except JWTError:
         raise HTTPException(status_code=401)
@@ -81,19 +68,16 @@ async def upload_file(
     file: UploadFile = File(...), 
     current_user: dict = Depends(get_current_user),
 ):
-
     os.makedirs("storage", exist_ok=True)
     file_location = f"storage/{file.filename}"
     
     with open(file_location, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-
     img = cv2.imread(file_location)
     results = reader.readtext(img, detail=0)
     text_block = " ".join(results)
     
-
     date_match = re.search(r'\d{2}/\d{2}/\d{4}', text_block)
     ocr_date = date_match.group(0) if date_match else "Не найдено"
     
@@ -104,13 +88,9 @@ async def upload_file(
     if "Cash Bill" in text_block: ocr_name = "Cash Bill"
     elif "Invoice" in text_block: ocr_name = "Invoice"
 
-    cursor.execute("""
-        INSERT INTO user_files (user_id, file_name, file_path, ocr_name, ocr_date, ocr_sum) 
-        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, created_at;
-    """, (current_user["id"], file.filename, file_location, ocr_name, ocr_date, ocr_sum))
-    
-    inserted_file = cursor.fetchone()
-    conn.commit()
+    inserted_file = db.insert_document(
+        current_user["id"], file.filename, file_location, ocr_name, ocr_date, ocr_sum
+    )
     
     return {
         "id": inserted_file[0],
@@ -122,35 +102,21 @@ async def upload_file(
         "created_at": inserted_file[1].strftime("%H:%M %d.%m.%Y")
     }
     
-    
 @app.post("/register", status_code=201)
 async def register(user: UserCreate):
-    cursor.execute("SELECT * FROM users WHERE email = %s;", (user.email,))
-    db_user = cursor.fetchone()
-    conn.commit()
+    db_user = db.get_user_by_email(user.email)
     if db_user:
         raise HTTPException(status_code=400, detail="User already exists")
     
     hashed_password = hash_password(user.password)
+    new_user = db.create_user(user.username, user.email, hashed_password)
     
-    cursor.execute("INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s);", (user.username, user.email, hashed_password))
-    conn.commit()
-    
-    cursor.execute("SELECT * FROM users WHERE email = %s;", (user.email,))
-    new_user = cursor.fetchone()
-    conn.commit()
-    
-    new_user = {"id": new_user[0],
-                "username": new_user[1],
-                "email": new_user[2]}
-    return new_user
-
+    return {"id": new_user[0], "username": new_user[1], "email": new_user[2]}
 
 @app.post("/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    cursor.execute("SELECT * FROM users WHERE email = %s;", (form_data.username,))
-    db_user = cursor.fetchone()
-    conn.commit()
+    db_user = db.get_user_by_email(form_data.username)
+    
     if not db_user or not verify_password(form_data.password, db_user[3]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -167,16 +133,14 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     
 @app.delete("/documents/{doc_id}")
 def delete_document(doc_id: int, current_user: dict = Depends(get_current_user)):
-    cursor.execute("SELECT file_path FROM user_files WHERE id = %s AND user_id = %s;", (doc_id, current_user["id"]))
-    file_record = cursor.fetchone()
+    file_record = db.get_document_by_id_and_user(doc_id, current_user["id"])
     
     if not file_record:
         raise HTTPException(status_code=404, detail="Документ не найден или у вас нет прав на его удаление")
     
     file_path = file_record[0]
     
-    cursor.execute("DELETE FROM user_files WHERE id = %s;", (doc_id,))
-    conn.commit()
+    db.delete_document_by_id(doc_id)
     
     if os.path.exists(file_path):
         os.remove(file_path)
@@ -185,14 +149,7 @@ def delete_document(doc_id: int, current_user: dict = Depends(get_current_user))
 
 @app.get("/documents")
 async def get_documents(current_user: dict = Depends(get_current_user)):
-    cursor.execute("""
-        SELECT id, file_name, file_path, ocr_name, ocr_date, ocr_sum, created_at 
-        FROM user_files 
-        WHERE user_id = %s 
-        ORDER BY created_at DESC;
-    """, (current_user["id"],))
-    records = cursor.fetchall()
-    conn.commit()
+    records = db.get_user_documents(current_user["id"])
     
     documents = []
     for row in records:
