@@ -1,8 +1,5 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, status, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, status, Depends, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-import easyocr
-import re
-import cv2
 from models import *
 import os
 from dotenv import load_dotenv
@@ -13,10 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import shutil
 import database as db
+from worker import process_scan, celery_app
+import logging
+from prometheus_fastapi_instrumentator import Instrumentator
 
 load_dotenv()
 
-# HASH
 SECRET_KEY = os.environ['HASH_SECRET_KEY']
 ALGORITHM = os.environ['HASH_ALGORITHM']
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
@@ -36,20 +35,18 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
         
         user = db.get_user_by_email(email)
-        
         if user is None: 
             raise HTTPException(status_code=401)
         return {"id": user[0], "username": user[1], "email": user[2]}
     except JWTError:
         raise HTTPException(status_code=401)
 
-# FASTAPI
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -60,11 +57,24 @@ app.add_middleware(
 )
 app.mount("/storage", StaticFiles(directory="storage"), name="storage")
 
-# EasyOCR
-reader = easyocr.Reader(['en'])
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("api_logger")
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"Входящий запрос: {request.method} {request.url.path}")
+    response = await call_next(request)
+    logger.info(f"Запрос завершен: {request.method} {request.url.path} - Статус: {response.status_code}")
+    return response
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 @app.post("/upload")
-async def upload_file(
+def upload_file(
     file: UploadFile = File(...), 
     current_user: dict = Depends(get_current_user),
 ):
@@ -74,36 +84,25 @@ async def upload_file(
     with open(file_location, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    img = cv2.imread(file_location)
-    results = reader.readtext(img, detail=0)
-    text_block = " ".join(results)
-    
-    date_match = re.search(r'\d{2}/\d{2}/\d{4}', text_block)
-    ocr_date = date_match.group(0) if date_match else "Не найдено"
-    
-    sum_match = re.search(r'TOTAL[:\s]*([\d\.,]+)', text_block, re.IGNORECASE)
-    ocr_sum = sum_match.group(1) if sum_match else "Не найдено"
-    
-    ocr_name = "Документ"
-    if "Cash Bill" in text_block: ocr_name = "Cash Bill"
-    elif "Invoice" in text_block: ocr_name = "Invoice"
-
-    inserted_file = db.insert_document(
-        current_user["id"], file.filename, file_location, ocr_name, ocr_date, ocr_sum
-    )
+    task = process_scan.delay(current_user["id"], file.filename, file_location)
     
     return {
-        "id": inserted_file[0],
-        "file_name": file.filename,
-        "file_url": f"http://localhost:8000/{file_location}",
-        "ocr_name": ocr_name,
-        "ocr_date": ocr_date,
-        "ocr_sum": ocr_sum,
-        "created_at": inserted_file[1].strftime("%H:%M %d.%m.%Y")
+        "task_id": task.id,
+        "status": "В очереди на обработку",
+        "file_name": file.filename
+    }
+
+@app.get("/tasks/{task_id}")
+def get_task_status(task_id: str):
+    task_result = celery_app.AsyncResult(task_id)
+    return {
+        "task_id": task_id,
+        "status": task_result.status,
+        "result": task_result.result if task_result.ready() else None
     }
     
 @app.post("/register", status_code=201)
-async def register(user: UserCreate):
+def register(user: UserCreate):
     db_user = db.get_user_by_email(user.email)
     if db_user:
         raise HTTPException(status_code=400, detail="User already exists")
@@ -114,7 +113,7 @@ async def register(user: UserCreate):
     return {"id": new_user[0], "username": new_user[1], "email": new_user[2]}
 
 @app.post("/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
     db_user = db.get_user_by_email(form_data.username)
     
     if not db_user or not verify_password(form_data.password, db_user[3]):
@@ -139,7 +138,6 @@ def delete_document(doc_id: int, current_user: dict = Depends(get_current_user))
         raise HTTPException(status_code=404, detail="Документ не найден или у вас нет прав на его удаление")
     
     file_path = file_record[0]
-    
     db.delete_document_by_id(doc_id)
     
     if os.path.exists(file_path):
@@ -148,7 +146,7 @@ def delete_document(doc_id: int, current_user: dict = Depends(get_current_user))
     return {"message": "Документ успешно удален"}
 
 @app.get("/documents")
-async def get_documents(current_user: dict = Depends(get_current_user)):
+def get_documents(current_user: dict = Depends(get_current_user)):
     records = db.get_user_documents(current_user["id"])
     
     documents = []
@@ -163,3 +161,18 @@ async def get_documents(current_user: dict = Depends(get_current_user)):
             "created_at": row[6].strftime("%H:%M %d.%m.%Y")
         })
     return documents
+
+@app.put("/documents/{doc_id}")
+def update_document(doc_id: int, doc_update: DocumentUpdate, current_user: dict = Depends(get_current_user)):
+    updated = db.update_document_fields(
+        doc_id, 
+        current_user["id"], 
+        doc_update.file_name, 
+        doc_update.ocr_name, 
+        doc_update.ocr_date, 
+        doc_update.ocr_sum
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Документ не найден или у вас нет прав на его изменение")
+    
+    return {"message": "Документ успешно обновлен"}

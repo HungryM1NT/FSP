@@ -6,17 +6,18 @@ load_dotenv()
 
 database = os.environ['POSTGRES_DB']
 user = os.environ['POSTGRES_USER']
-password = os.environ['POSTGRES_DB_PASSWORD']
+password = os.environ['POSTGRES_PASSWORD']
+host = os.environ['POSTGRES_HOST']
 
+# Инициализируем соединение
 conn = psycopg2.connect(
     database=database,
     user=user,
     password=password,
-    host="localhost",
+    host=host,
     port="5432"
 )
 cursor = conn.cursor()
-
 
 def get_user_by_email(email: str):
     cursor.execute("SELECT * FROM users WHERE email = %s;", (email,))
@@ -55,3 +56,14 @@ def get_user_documents(user_id: int):
         ORDER BY created_at DESC;
     """, (user_id,))
     return cursor.fetchall()
+
+def update_document_fields(doc_id: int, user_id: int, file_name: str, ocr_name: str, ocr_date: str, ocr_sum: str):
+    cursor.execute("""
+        UPDATE user_files 
+        SET file_name = %s, ocr_name = %s, ocr_date = %s, ocr_sum = %s 
+        WHERE id = %s AND user_id = %s
+        RETURNING id;
+    """, (file_name, ocr_name, ocr_date, ocr_sum, doc_id, user_id))
+    updated_id = cursor.fetchone()
+    conn.commit()
+    return updated_id
